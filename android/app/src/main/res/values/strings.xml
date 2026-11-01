@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">RideAssist</string>
+    <string name="a11y_desc">Reads ride request cards in the driver apps you choose and taps Accept when your rules match.</string>
+</resources>
