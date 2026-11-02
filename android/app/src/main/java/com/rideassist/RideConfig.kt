@@ -30,9 +30,17 @@ data class RideConfig(
         const val PREFS = "rideassist"
         const val KEY = "config"
 
+        val DEFAULT_PACKAGES = setOf(
+            "com.rapido.rider",
+            "com.theporter.android.driverapp",
+            "com.ubercab.driver",
+            "com.ubercab.partner",
+            "com.olacabs.oladriver"
+        )
+
         val DEFAULT_JSON = """
         {"enabled":false,
-         "packages":["com.rapido.rider","com.olacabs.oladriver"],
+         "packages":["com.rapido.rider","com.theporter.android.driverapp","com.ubercab.driver","com.ubercab.partner","com.olacabs.oladriver"],
          "acceptTexts":["Accept","Accept Ride","Accept Order","Accept Request","Confirm","Take","स्वीकार करें","स्वीकार"],
          "sliderTexts":["Swipe to accept","Slide to accept","Swipe to confirm","Slide to confirm","Swipe right","Slide to start","स्वाइप करें"],
          "minFare":0,"minPerKm":0,"maxPickupKm":0,"minTripKm":0,"maxTripKm":0,
@@ -60,7 +68,7 @@ data class RideConfig(
             val bt = o.optJSONObject("bookingTypes") ?: JSONObject()
             return RideConfig(
                 enabled = o.optBoolean("enabled"),
-                packages = strings(o.optJSONArray("packages")).toSet(),
+                packages = strings(o.optJSONArray("packages")).toSet().let { if (it.isEmpty()) DEFAULT_PACKAGES else it },
                 acceptTexts = strings(o.optJSONArray("acceptTexts")),
                 sliderTexts = o.optJSONArray("sliderTexts")?.let { strings(it) }
                     ?: strings(JSONObject(DEFAULT_JSON).getJSONArray("sliderTexts")),

@@ -2,6 +2,7 @@ package com.rideassist
 
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
+import android.app.Notification
 import android.graphics.Path
 import android.graphics.Rect
 import android.os.Handler
@@ -21,6 +22,13 @@ class RideAccessibilityService : AccessibilityService() {
         val card: RideCard,
     )
 
+    private val countdownRe = Regex(
+        """(?i)(?:enabled\s+in|(?:match|confirm|accept|take)\s+in)\s*(\d{1,2})\s*(?:s|sec|secs|seconds)?\b"""
+    )
+    private val acceptRe = Regex(
+        """(?i)^[^\p{L}\p{N}]*(?:match|confirm|accept|take|स्वीकार)[^\p{L}\p{N}]*${'$'}"""
+    )
+
     override fun onServiceConnected() {
         instance = this
     }
@@ -33,18 +41,30 @@ class RideAccessibilityService : AccessibilityService() {
     override fun onInterrupt() {}
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        val pkg = event?.packageName?.toString() ?: return
         val cfg = RideConfig.load(this)
-        val watched = pkg in cfg.packages || (cfg.testMode && pkg == packageName)
-        if (!cfg.enabled || !watched) return
-        val root = rootInActiveWindow ?: return
-        if (root.packageName?.toString() != pkg) return
+        if (!cfg.enabled) return
+
+        val watchedPackages = cfg.packages + (if (cfg.testMode) setOf(packageName) else emptySet())
+
+        // 1. Handle notification events (Rapido / Porter / Uber head-up notifications)
+        if (event?.eventType == AccessibilityEvent.TYPE_NOTIFICATION_STATE_CHANGED) {
+            val notePkg = event.packageName?.toString() ?: return
+            if (notePkg in watchedPackages) {
+                handleNotification(event, notePkg, cfg)
+            }
+            return
+        }
+
+        // 2. Resolve target driver app window using WindowResolver (handles overlays, video calls, floating bubbles)
+        val resolved = WindowResolver.resolve(this, event, watchedPackages) ?: return
+        val root = resolved.root
+        val pkg = resolved.pkg
 
         val screenTexts = ArrayList<String>()
         collect(root, screenTexts)
         if (screenTexts.isEmpty()) return
 
-        // 1. Discover all action nodes (Accept buttons or sliders)
+        // 3. Discover action nodes (Accept buttons or sliders)
         val acceptButtons = findAllAcceptButtons(root, cfg.acceptTexts)
         val candidates = ArrayList<Candidate>()
 
@@ -70,18 +90,32 @@ class RideAccessibilityService : AccessibilityService() {
             }
         }
 
-        if (candidates.isEmpty()) return
+        // If no candidate action button or slider found: log diagnostic visibility
+        if (candidates.isEmpty()) {
+            val now = System.currentTimeMillis()
+            val sig = "$pkg|${screenTexts.take(3).joinToString()}"
+            if (sig != lastSignature && now - lastHandledAt >= 10000) {
+                lastSignature = sig
+                lastHandledAt = now
+                log(
+                    pkg,
+                    RideCard(null, null, null, null, false, screenTexts.joinToString(" | ")),
+                    false,
+                    "watching screen (no order card active)"
+                )
+            }
+            return
+        }
 
-        // 2. Evaluate all candidate cards against rules
+        // 4. Evaluate all candidate cards against configured rules
         val passing = candidates.filter { reject(cfg, it.card) == null }
 
         if (passing.isEmpty()) {
-            // Log rejection reason for the primary/first candidate
             val first = candidates.first()
             val reason = reject(cfg, first.card) ?: "rejected"
             val sig = "${first.card.fare}|${first.card.pickupKm}|${first.card.tripKm}|${first.card.type}"
             val now = System.currentTimeMillis()
-            if (sig != lastSignature || now - lastHandledAt >= 8000) {
+            if (sig != lastSignature || now - lastHandledAt >= 6000) {
                 lastSignature = sig
                 lastHandledAt = now
                 log(pkg, first.card, false, reason)
@@ -89,33 +123,100 @@ class RideAccessibilityService : AccessibilityService() {
             return
         }
 
-        // 3. Choose the best matching candidate (prefer closest pickup distance)
+        // 5. Choose best candidate (closest pickup)
         val winner = passing.minByOrNull { it.card.pickupKm ?: Double.MAX_VALUE } ?: passing.first()
         val signature = "${winner.card.fare}|${winner.card.pickupKm}|${winner.card.tripKm}|${winner.card.type}|${winner.card.isBoost}"
         val now = System.currentTimeMillis()
-        if (signature == lastSignature && now - lastHandledAt < 8000) return
+        if (signature == lastSignature && now - lastHandledAt < 6000) return
         lastSignature = signature
         lastHandledAt = now
 
-        // 4. Trigger accept action
+        // 6. Execute Accept action
         main.postDelayed({
-            val r = rootInActiveWindow
             if (winner.button != null) {
                 var ok = clickable(winner.button)?.performAction(AccessibilityNodeInfo.ACTION_CLICK) == true
-                if (!ok && r != null) {
-                    val fallback = findAccept(r, cfg.acceptTexts)
-                    ok = clickable(fallback)?.performAction(AccessibilityNodeInfo.ACTION_CLICK) == true
+                if (!ok) {
+                    // Fallback to gesture tap on center coordinates of the button
+                    val bounds = Rect()
+                    winner.button.getBoundsInScreen(bounds)
+                    if (!bounds.isEmpty) {
+                        tap(bounds.exactCenterX(), bounds.exactCenterY()) { tapOk ->
+                            log(pkg, winner.card, tapOk, if (tapOk) "accepted (tap)" else "click failed")
+                            if (tapOk) RideFeedback.accepted(this, cfg, winner.card)
+                        }
+                        return@postDelayed
+                    }
                 }
                 log(pkg, winner.card, ok, if (ok) "accepted" else "click failed")
                 if (ok) RideFeedback.accepted(this, cfg, winner.card)
             } else if (winner.sliderRect != null) {
-                val rect = r?.let { findSlider(it, cfg.sliderTexts) } ?: winner.sliderRect
-                swipe(rect) { ok ->
+                swipe(winner.sliderRect) { ok ->
                     log(pkg, winner.card, ok, if (ok) "accepted (slider)" else "swipe failed")
                     if (ok) RideFeedback.accepted(this, cfg, winner.card)
                 }
             }
         }, cfg.delayMs)
+    }
+
+    private fun handleNotification(event: AccessibilityEvent, pkg: String, cfg: RideConfig) {
+        val parcelable = event.parcelableData
+        if (parcelable !is Notification) return
+
+        val extras = parcelable.extras
+        val title = extras.getCharSequence(Notification.EXTRA_TITLE)?.toString() ?: ""
+        val text = extras.getCharSequence(Notification.EXTRA_TEXT)?.toString() ?: ""
+        val bigText = extras.getCharSequence(Notification.EXTRA_BIG_TEXT)?.toString() ?: ""
+        val combined = "$title | $text | $bigText".trim()
+        val card = RideParser.parse(listOf(combined))
+
+        // Check notification action buttons
+        val actions = parcelable.actions
+        if (!actions.isNullOrEmpty()) {
+            for (action in actions) {
+                val actionTitle = action.title?.toString() ?: ""
+                if (isAcceptText(actionTitle, cfg.acceptTexts)) {
+                    val rej = reject(cfg, card)
+                    if (rej == null) {
+                        try {
+                            action.actionIntent.send()
+                            log(pkg, card, true, "accepted via notification")
+                            RideFeedback.accepted(this, cfg, card)
+                        } catch (e: Throwable) {
+                            log(pkg, card, false, "notification action failed: ${e.message}")
+                        }
+                    } else {
+                        log(pkg, card, false, rej)
+                    }
+                    return
+                }
+            }
+        }
+
+        // If no action button, opening the notification contentIntent brings the app foreground
+        val rej = reject(cfg, card)
+        if (rej == null && parcelable.contentIntent != null) {
+            try {
+                parcelable.contentIntent.send()
+                log(pkg, card, true, "opened from notification to accept")
+            } catch (_: Throwable) {}
+        }
+    }
+
+    private fun isAcceptText(text: String, customLabels: List<String>): Boolean {
+        val t = text.trim()
+        if (t.isBlank()) return false
+        val lower = t.lowercase()
+        if (lower.contains("decline") || lower.contains("reject") || lower.contains("cancel") || lower.contains("skip")) {
+            return false
+        }
+        if (countdownRe.find(t) != null) return true
+        if (acceptRe.find(t) != null) return true
+        if (lower.startsWith("accept") || lower.startsWith("confirm") || lower.startsWith("take") || lower.startsWith("स्वीकार")) return true
+        if (lower.contains("accept") || lower.contains("स्वीकार")) return true
+        for (l in customLabels) {
+            if (lower.contains(l.lowercase())) return true
+        }
+        return false
     }
 
     private fun reject(c: RideConfig, card: RideCard): String? {
@@ -127,18 +228,22 @@ class RideAccessibilityService : AccessibilityService() {
         if (c.allowedKeywords.isNotEmpty() && c.allowedKeywords.none { it.isNotBlank() && lower.contains(it.lowercase()) })
             return "outside Go-To area"
 
-        // Fare evaluation: handle unknown fare (e.g. Rapido Bike)
+        // Fare evaluation: handle unknown fare
         if (card.fare != null) {
-            if (c.minFare > 0 && card.fare < c.minFare) return "fare below min"
+            if (c.minFare > 0 && card.fare < c.minFare) return "fare below min (₹${card.fare.toInt()} < ₹${c.minFare.toInt()})"
         } else {
             if (!c.acceptUnknownFare) return "fare hidden (rejected)"
         }
 
-        if (c.maxPickupKm > 0 && (card.pickupKm ?: 0.0) > c.maxPickupKm) return "pickup too far"
+        if (c.maxPickupKm > 0 && (card.pickupKm ?: 0.0) > c.maxPickupKm) {
+            return "pickup too far (${card.pickupKm} km > ${c.maxPickupKm} km)"
+        }
         card.tripKm?.let {
-            if (c.minTripKm > 0 && it < c.minTripKm) return "trip too short"
-            if (c.maxTripKm > 0 && it > c.maxTripKm) return "trip too long"
-            if (card.fare != null && c.minPerKm > 0 && it > 0 && card.fare / it < c.minPerKm) return "₹/km too low"
+            if (c.minTripKm > 0 && it < c.minTripKm) return "trip too short ($it km < ${c.minTripKm} km)"
+            if (c.maxTripKm > 0 && it > c.maxTripKm) return "trip too long ($it km > ${c.maxTripKm} km)"
+            if (card.fare != null && c.minPerKm > 0 && it > 0 && card.fare / it < c.minPerKm) {
+                return "₹/km too low (₹${(card.fare / it).toInt()}/km < ₹${c.minPerKm.toInt()}/km)"
+            }
         }
         return null
     }
@@ -152,38 +257,50 @@ class RideAccessibilityService : AccessibilityService() {
 
     private fun findAllAcceptButtons(root: AccessibilityNodeInfo, labels: List<String>): List<AccessibilityNodeInfo> {
         val result = ArrayList<AccessibilityNodeInfo>()
-        for (l in labels) {
-            val hits = root.findAccessibilityNodeInfosByText(l) ?: continue
+        val seen = HashSet<AccessibilityNodeInfo>()
+        val queries = listOf("Accept", "Confirm", "Take", "स्वीकार") + labels
+
+        // 1. Fast indexed search
+        for (q in queries) {
+            val hits = root.findAccessibilityNodeInfosByText(q) ?: continue
             for (hit in hits) {
-                val label = (hit.text ?: hit.contentDescription)?.toString()?.trim()
-                if (label.equals(l, true)) {
-                    clickable(hit)?.let { clickNode ->
-                        if (!result.contains(clickNode)) {
-                            result.add(clickNode)
-                        }
+                val label = (hit.text ?: hit.contentDescription)?.toString() ?: ""
+                if (isAcceptText(label, labels)) {
+                    val clickNode = clickable(hit) ?: hit
+                    if (seen.add(clickNode)) {
+                        result.add(clickNode)
                     }
                 }
             }
         }
+
+        // 2. Full tree traversal fallback (essential for Chrome, WebViews, and custom Compose views)
+        if (result.isEmpty()) {
+            collectButtonsRecursive(root, labels, result, seen)
+        }
+
         return result
     }
 
-    private fun findAccept(root: AccessibilityNodeInfo, labels: List<String>): AccessibilityNodeInfo? {
-        for (l in labels) {
-            val hit = root.findAccessibilityNodeInfosByText(l)
-                ?.firstOrNull {
-                    val label = (it.text ?: it.contentDescription)?.toString()?.trim()
-                    label.equals(l, true) && clickable(it) != null
-                }
-            if (hit != null) return hit
+    private fun collectButtonsRecursive(
+        n: AccessibilityNodeInfo?,
+        labels: List<String>,
+        result: MutableList<AccessibilityNodeInfo>,
+        seen: MutableSet<AccessibilityNodeInfo>
+    ) {
+        if (n == null) return
+        val label = (n.text ?: n.contentDescription)?.toString() ?: ""
+        if (isAcceptText(label, labels)) {
+            val clickNode = clickable(n) ?: n
+            if (seen.add(clickNode)) {
+                result.add(clickNode)
+            }
         }
-        return null
+        for (i in 0 until n.childCount) {
+            collectButtonsRecursive(n.getChild(i), labels, result, seen)
+        }
     }
 
-    /**
-     * Finds the card ancestor around [anchor] that contains distance info (Km/km/m)
-     * without including any sibling accept buttons (for multi-order screens).
-     */
     private fun findCardContainer(anchor: AccessibilityNodeInfo, allAcceptNodes: List<AccessibilityNodeInfo>): AccessibilityNodeInfo {
         var cur = anchor.parent
         var best = anchor
@@ -214,7 +331,6 @@ class RideAccessibilityService : AccessibilityService() {
         return false
     }
 
-    /** Bounds of the slider track: the widest ancestor (up to 3 levels) of the "swipe to accept" label that stays inside the screen. */
     private fun labelNode(root: AccessibilityNodeInfo, l: String): AccessibilityNodeInfo? {
         val hits = root.findAccessibilityNodeInfosByText(l) ?: return null
         return hits.firstOrNull { (it.text ?: it.contentDescription)?.toString()?.trim().equals(l, true) }
@@ -241,6 +357,17 @@ class RideAccessibilityService : AccessibilityService() {
             if (!best.isEmpty) return best
         }
         return null
+    }
+
+    private fun tap(x: Float, y: Float, done: (Boolean) -> Unit) {
+        val path = Path().apply { moveTo(x, y) }
+        val stroke = GestureDescription.StrokeDescription(path, 0, 50)
+        val gesture = GestureDescription.Builder().addStroke(stroke).build()
+        val ok = dispatchGesture(gesture, object : GestureResultCallback() {
+            override fun onCompleted(gestureDescription: GestureDescription?) = done(true)
+            override fun onCancelled(gestureDescription: GestureDescription?) = done(false)
+        }, null)
+        if (!ok) done(false)
     }
 
     @Volatile private var isSwiping = false
@@ -276,18 +403,34 @@ class RideAccessibilityService : AccessibilityService() {
     private fun clickable(n: AccessibilityNodeInfo?): AccessibilityNodeInfo? {
         var cur = n
         while (cur != null) {
-            if (cur.isClickable) return cur
+            if (cur.isClickable || cur.actionList.any { it.id == AccessibilityNodeInfo.ACTION_CLICK }) {
+                return cur
+            }
             cur = cur.parent
         }
         return null
     }
 
     private fun log(pkg: String, c: RideCard, accepted: Boolean, note: String) {
+        val appName = when {
+            pkg.contains("rapido", true) -> "Rapido"
+            pkg.contains("porter", true) -> "Porter"
+            pkg.contains("uber", true) -> "Uber"
+            pkg.contains("ola", true) -> "Ola"
+            else -> pkg.substringAfterLast('.')
+        }
         val e = JSONObject()
-            .put("time", System.currentTimeMillis()).put("pkg", pkg)
-            .put("fare", c.fare ?: JSONObject.NULL).put("pickupKm", c.pickupKm ?: JSONObject.NULL)
-            .put("tripKm", c.tripKm ?: JSONObject.NULL).put("type", c.type ?: JSONObject.NULL)
-            .put("accepted", accepted).put("note", note)
+            .put("id", System.currentTimeMillis())
+            .put("time", System.currentTimeMillis())
+            .put("pkg", pkg)
+            .put("appName", appName)
+            .put("fare", c.fare ?: JSONObject.NULL)
+            .put("pickupKm", c.pickupKm ?: JSONObject.NULL)
+            .put("tripKm", c.tripKm ?: JSONObject.NULL)
+            .put("type", c.type ?: JSONObject.NULL)
+            .put("accepted", accepted)
+            .put("note", note)
+            .put("rawText", c.text.take(300))
         RideHistory.add(this, e)
         RideBridge.emit("ride", e.toString())
     }

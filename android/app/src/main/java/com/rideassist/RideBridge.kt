@@ -50,11 +50,50 @@ class RideAssistModule(private val rc: ReactApplicationContext) : ReactContextBa
 
     @ReactMethod fun getInstalledApps(p: Promise) {
         val pm = rc.packageManager
-        val q = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+        val apps = mutableMapOf<String, String>()
+
+        try {
+            val q = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+            for (ri in pm.queryIntentActivities(q, 0)) {
+                val pkg = ri.activityInfo.packageName
+                if (pkg != rc.packageName) {
+                    apps[pkg] = ri.loadLabel(pm).toString()
+                }
+            }
+        } catch (_: Throwable) {}
+
+        try {
+            for (pi in pm.getInstalledPackages(0)) {
+                val pkg = pi.packageName
+                if (pkg != rc.packageName && !apps.containsKey(pkg)) {
+                    val appInfo = pi.applicationInfo
+                    if (appInfo != null) {
+                        apps[pkg] = pm.getApplicationLabel(appInfo).toString()
+                    }
+                }
+            }
+        } catch (_: Throwable) {}
+
+        val knownNames = mapOf(
+            "com.rapido.rider" to "Rapido Captain",
+            "com.theporter.android.driverapp" to "Porter Partner / Driver",
+            "com.ubercab.driver" to "Uber Driver",
+            "com.ubercab.partner" to "Uber Partner",
+            "com.olacabs.oladriver" to "Ola Driver"
+        )
+        for ((pkg, friendly) in knownNames) {
+            if (apps.containsKey(pkg)) {
+                apps[pkg] = friendly
+            }
+        }
+
         val arr = Arguments.createArray()
-        pm.queryIntentActivities(q, 0).map { it.activityInfo.packageName to it.loadLabel(pm).toString() }
-            .filter { it.first != rc.packageName }.distinctBy { it.first }.sortedBy { it.second.lowercase() }
-            .forEach { (pkg, label) -> arr.pushMap(Arguments.createMap().apply { putString("pkg", pkg); putString("label", label) }) }
+        apps.entries.sortedBy { it.value.lowercase() }.forEach { (pkg, label) ->
+            arr.pushMap(Arguments.createMap().apply {
+                putString("pkg", pkg)
+                putString("label", label)
+            })
+        }
         p.resolve(arr)
     }
 

@@ -8,8 +8,39 @@ import {dict} from './src/i18n';
 import {events, native} from './src/native';
 
 const C = {bg: '#0F1115', card: '#1A1D24', text: '#F2F3F5', mute: '#8A8F9A', green: '#2E7D32', red: '#C62828', accent: '#FFC400'};
-const ICON: Record<string, string> = {home: '🏠', rules: '🎚️', history: '🕘', test: '🧪', settings: '⚙️'};
-type Tab = 'home' | 'rules' | 'history' | 'test' | 'settings';
+const ICON: Record<string, string> = {home: '🏠', rules: '🎚️', activity: '⚡', test: '🧪', settings: '⚙️'};
+type Tab = 'home' | 'rules' | 'activity' | 'test' | 'settings';
+
+const DRIVER_APPS = [
+  {pkg: 'com.rapido.rider', name: 'Rapido Captain', icon: '🟡'},
+  {pkg: 'com.theporter.android.driverapp', name: 'Porter Partner', icon: '🔵'},
+  {pkg: 'com.ubercab.driver', name: 'Uber Driver', icon: '⚫'},
+  {pkg: 'com.olacabs.oladriver', name: 'Ola Driver', icon: '🟢'},
+];
+
+function QuickAppsCard({packages, onChange}: {packages: string[]; onChange: (pkgs: string[]) => void}) {
+  return (
+    <View style={s.card}>
+      <Text style={s.h}>Monitored Driver Apps</Text>
+      <Text style={s.mute}>Instant auto-accept for supported apps:</Text>
+      {DRIVER_APPS.map(app => {
+        const on = packages.includes(app.pkg);
+        return (
+          <View key={app.pkg} style={[s.row, {paddingVertical: 4}]}>
+            <Text style={s.label}>{app.icon} {app.name}</Text>
+            <Switch
+              value={on}
+              onValueChange={v => {
+                onChange(v ? [...packages, app.pkg] : packages.filter(x => x !== app.pkg));
+              }}
+              trackColor={{true: C.green, false: '#444'}}
+            />
+          </View>
+        );
+      })}
+    </View>
+  );
+}
 
 function AppPicker({selected, onChange, label, placeholder}: {selected: string[]; onChange: (v: string[]) => void; label: string; placeholder: string}) {
   const [apps, setApps] = useState<{pkg: string; label: string}[]>([]);
@@ -63,7 +94,7 @@ function RulesScreen() {
       minTripKm: num(d.minTripKm), maxTripKm: num(d.maxTripKm),
       allowedKeywords: list(d.allowed), blockedKeywords: list(d.blocked), bookingTypes: types,
     });
-    const back = await native.getConfig(); // what the phone actually stored
+    const back = await native.getConfig();
     setMsg(`${t.saved}: ₹${back.minFare} min · pickup ≤ ${back.maxPickupKm || '∞'} km · trip ${back.minTripKm || 0}–${back.maxTripKm || '∞'} km`);
   };
   return (
@@ -94,7 +125,7 @@ function RulesScreen() {
 
 function randomCard(rapidoMode: boolean = false) {
   const r = (a: number, b: number) => Math.round((a + Math.random() * (b - a)) * 10) / 10;
-  const types = rapidoMode ? ['Bike', 'Bike Boost'] : ['Bike', 'Auto', 'Cab', 'Parcel'];
+  const types = rapidoMode ? ['Bike', 'Auto', 'Bike Boost'] : ['Bike', 'Auto', 'Cab', 'Parcel'];
   const type = types[Math.floor(Math.random() * types.length)];
   const isRapidoBikeNoFare = rapidoMode && type === 'Bike';
   return {
@@ -102,8 +133,8 @@ function randomCard(rapidoMode: boolean = false) {
     pickup: r(0.3, 6),
     trip: r(1, 25),
     type,
-    area: ['Sector 72 Noida', 'ManiMajra', 'Baltana Industrial', 'MG Road', 'Airport'][Math.floor(Math.random() * 5)],
-    dropArea: ['Sector 67 Noida', 'IT-Park-Chd', 'Saketri', 'Sector 18', 'Cyber City'][Math.floor(Math.random() * 5)],
+    area: ['Ashiyana - Phoenix United Mall', 'LDA Colony', 'Sector 72 Noida', 'Krishna Nagar', 'Airport'][Math.floor(Math.random() * 5)],
+    dropArea: ['Krishna Nagar - Hari Om Nagar', 'Alambagh', 'Sector 18', 'Cyber City'][Math.floor(Math.random() * 4)],
   };
 }
 
@@ -150,14 +181,131 @@ function TestLab() {
         {slider ? (
           <SwipeAccept label="Swipe to accept" onDone={() => setTapped(true)} />
         ) : (
-          <Pressable accessible accessibilityRole="button" accessibilityLabel="Accept" style={[s.btn, {marginTop: 8}]} onPress={() => setTapped(true)}>
-            <Text style={s.btnTxt}>Accept</Text>
+          <Pressable accessible accessibilityRole="button" accessibilityLabel="Accept in 7s" style={[s.btn, {marginTop: 8}]} onPress={() => setTapped(true)}>
+            <Text style={s.btnTxt}>Accept in 7s</Text>
           </Pressable>
         )}
         <Text style={{color: tapped ? C.green : C.mute, marginTop: 6}}>{tapped ? '✓ ' + t.engineTapped : t.waiting}</Text>
       </View>
       <Pressable style={s.btn} onPress={next}><Text style={s.btnTxt}>{t.newReq}</Text></Pressable>
     </ScrollView>
+  );
+}
+
+function ActivityScreen() {
+  const {history, refreshHistory, lang} = useStore();
+  const t = dict[lang];
+  const [filter, setFilter] = useState<'all' | 'accepted' | 'declined' | 'detected'>('all');
+  const [liveDebug, setLiveDebug] = useState(false);
+  const [expandedKey, setExpandedKey] = useState<string | null>(null);
+
+  const filtered = history.filter(item => {
+    const isAccepted = item.accepted;
+    const isDetected = item.note.toLowerCase().includes('watching') || item.note.toLowerCase().includes('detected');
+    const isDeclined = !isAccepted && !isDetected;
+    if (filter === 'accepted') return isAccepted;
+    if (filter === 'declined') return isDeclined;
+    if (filter === 'detected') return isDetected;
+    return true;
+  });
+
+  return (
+    <View style={{flex: 1}}>
+      <View style={[s.pad, {paddingBottom: 4}]}>
+        <View style={s.row}>
+          <Text style={s.h}>{t.activity} ({history.length})</Text>
+          <Pressable style={s.btn} onPress={async () => { await native.clearHistory(); refreshHistory(); }}>
+            <Text style={s.btnTxt}>{t.clear}</Text>
+          </Pressable>
+        </View>
+
+        {/* Filter Pills */}
+        <View style={{flexDirection: 'row', gap: 8, marginTop: 8}}>
+          {(['all', 'accepted', 'declined', 'detected'] as const).map(f => {
+            const active = filter === f;
+            return (
+              <Pressable
+                key={f}
+                style={[
+                  s.pill,
+                  active && {backgroundColor: C.accent},
+                ]}
+                onPress={() => setFilter(f)}>
+                <Text style={[s.pillTxt, active && {color: '#000', fontWeight: '700'}]}>
+                  {t[f]}
+                </Text>
+              </Pressable>
+            );
+          })}
+        </View>
+
+        {/* Live Debug Toggle */}
+        <View style={[s.row, {marginTop: 6}]}>
+          <Text style={s.mute}>{t.liveDebug}</Text>
+          <Switch value={liveDebug} onValueChange={setLiveDebug} trackColor={{true: C.green, false: '#444'}} />
+        </View>
+      </View>
+
+      <FlatList
+        data={filtered}
+        keyExtractor={(h, i) => `${h.time}-${i}`}
+        contentContainerStyle={s.pad}
+        ListEmptyComponent={
+          <View style={[s.card, {alignItems: 'center', paddingVertical: 32}]}>
+            <Text style={{fontSize: 32, marginBottom: 8}}>⚡</Text>
+            <Text style={s.label}>{t.empty}</Text>
+            <Text style={[s.mute, {textAlign: 'center', marginTop: 4}]}>
+              Open Rapido, Porter, Uber, or Ola. Any detected screens, incoming orders, and rules applied will appear here live.
+            </Text>
+          </View>
+        }
+        renderItem={({item, index}) => {
+          const isAccepted = item.accepted;
+          const isDetected = item.note.toLowerCase().includes('watching') || item.note.toLowerCase().includes('detected');
+          const isFailed = item.note.toLowerCase().includes('failed');
+          const badgeColor = isAccepted ? C.green : isFailed ? C.red : isDetected ? '#3B82F6' : '#F59E0B';
+          const badgeText = isAccepted ? `✓ ${t.accepted}` : isFailed ? '⚠️ Failed' : isDetected ? `👁️ ${t.detected}` : `✕ ${t.declined}`;
+          const itemKey = `${item.time}-${index}`;
+          const isExpanded = expandedKey === itemKey || liveDebug;
+
+          return (
+            <Pressable
+              style={s.card}
+              onPress={() => setExpandedKey(expandedKey === itemKey ? null : itemKey)}>
+              <View style={s.row}>
+                <View style={{flexDirection: 'row', alignItems: 'center', gap: 6}}>
+                  <View style={[s.statusBadge, {backgroundColor: badgeColor}]}>
+                    <Text style={s.statusBadgeTxt}>{badgeText}</Text>
+                  </View>
+                  <Text style={[s.label, {fontWeight: '700'}]}>{item.appName || item.pkg.split('.').pop()}</Text>
+                </View>
+                <Text style={s.mute}>{new Date(item.time).toLocaleTimeString()}</Text>
+              </View>
+
+              {(item.fare != null || item.pickupKm != null || item.tripKm != null || item.type) ? (
+                <Text style={[s.label, {fontSize: 16, fontWeight: '600'}]}>
+                  {item.fare != null ? `₹${item.fare} · ` : ''}
+                  {item.type ? `${item.type} · ` : ''}
+                  {item.pickupKm != null ? `${item.pickupKm} km pickup · ` : ''}
+                  {item.tripKm != null ? `${item.tripKm} km trip` : ''}
+                </Text>
+              ) : null}
+
+              <Text style={{color: isAccepted ? C.green : isDetected ? '#93C5FD' : '#FCD34D', fontSize: 14}}>
+                {item.note}
+              </Text>
+
+              {isExpanded && item.rawText ? (
+                <View style={{marginTop: 6, backgroundColor: '#0F1115', padding: 8, borderRadius: 6}}>
+                  <Text style={[s.mute, {fontSize: 11, fontWeight: '700', marginBottom: 2}]}>{t.rawDetails}:</Text>
+                  <Text style={{color: '#9CA3AF', fontSize: 12, fontFamily: 'monospace'}}>{item.rawText}</Text>
+                </View>
+              ) : null}
+            </Pressable>
+          );
+        }}
+      />
+    </View>
   );
 }
 
@@ -250,6 +398,9 @@ function App() {
         <Text style={s.label}>{t.today}</Text>
         <Text style={s.label}>{todays.length} {t.rides} · ₹{Math.round(earned)} {t.earned}</Text>
       </View>
+
+      <QuickAppsCard packages={config.packages} onChange={pkgs => patch({packages: pkgs})} />
+
       <Text style={s.h}>{t.setup}</Text>
       {([
         ['accessibility', status.accessibility, native.openAccessibilitySettings],
@@ -268,29 +419,7 @@ function App() {
   );
 
   const rules = <RulesScreen />;
-
-  const hist = (
-    <View style={{flex: 1}}>
-      <Pressable style={[s.btn, {margin: 16}]} onPress={async () => { await native.clearHistory(); refreshHistory(); }}>
-        <Text style={s.btnTxt}>{t.clear}</Text>
-      </Pressable>
-      <FlatList
-        data={history} keyExtractor={(h, i) => `${h.time}-${i}`} contentContainerStyle={s.pad}
-        ListEmptyComponent={<Text style={s.mute}>{t.empty}</Text>}
-        renderItem={({item}) => (
-          <View style={s.card}>
-            <Text style={{color: item.accepted ? C.green : C.accent, fontWeight: '700'}}>
-              {item.accepted ? t.accepted : t.skipped} · {item.note}
-            </Text>
-            <Text style={s.label}>
-              ₹{item.fare ?? '?'} · pickup {item.pickupKm ?? '?'} km · trip {item.tripKm ?? '?'} km · {item.type ?? '?'}
-            </Text>
-            <Text style={s.mute}>{new Date(item.time).toLocaleTimeString()} · {item.pkg}</Text>
-          </View>
-        )}
-      />
-    </View>
-  );
+  const activity = <ActivityScreen />;
 
   const settings = (
     <ScrollView contentContainerStyle={s.pad} keyboardShouldPersistTaps="handled" automaticallyAdjustKeyboardInsets>
@@ -309,7 +438,7 @@ function App() {
     </ScrollView>
   );
 
-  const body = {home, rules, history: hist, test: <TestLab />, settings}[tab];
+  const body = {home, rules, activity, test: <TestLab />, settings}[tab];
   return (
     <SafeAreaView style={s.root}>
       <StatusBar barStyle="light-content" />
@@ -317,7 +446,7 @@ function App() {
         <View style={{flex: 1}}>{body}</View>
         {!kb && (
           <View style={s.tabs}>
-            {(['home', 'rules', 'history', 'test', 'settings'] as Tab[]).map(k => (
+            {(['home', 'rules', 'activity', 'test', 'settings'] as Tab[]).map(k => (
               <Pressable key={k} style={s.tab} onPress={() => setTab(k)}>
                 <Text style={{fontSize: 20}}>{ICON[k]}</Text>
                 <Text style={{color: tab === k ? C.accent : C.mute, fontWeight: '600', fontSize: 12}}>{t[k]}</Text>
@@ -349,4 +478,8 @@ const s = StyleSheet.create({
   btnTxt: {color: '#000', fontWeight: '700'},
   tabs: {flexDirection: 'row', backgroundColor: C.card},
   tab: {flex: 1, alignItems: 'center', paddingVertical: 8, gap: 2},
+  pill: {paddingHorizontal: 12, paddingVertical: 6, borderRadius: 16, backgroundColor: '#262A34'},
+  pillTxt: {color: C.mute, fontSize: 13, fontWeight: '500'},
+  statusBadge: {paddingHorizontal: 6, paddingVertical: 2, borderRadius: 4},
+  statusBadgeTxt: {color: '#fff', fontSize: 11, fontWeight: '700'},
 });

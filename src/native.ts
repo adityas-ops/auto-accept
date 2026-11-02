@@ -23,14 +23,17 @@ export type Config = {
 };
 
 export type HistoryItem = {
+  id?: number;
   time: number;
   pkg: string;
+  appName?: string;
   fare: number | null;
   pickupKm: number | null;
   tripKm: number | null;
   type: string | null;
   accepted: boolean;
   note: string;
+  rawText?: string;
 };
 
 export type Status = {accessibility: boolean; overlay: boolean; battery: boolean};
